@@ -232,8 +232,6 @@ This is kind of a contrived example, but it shows off a few features I wanted to
 * multiple clauses
 * matching on args
 
-## Section
-
 ```elixir
 defmodule MyApp do
   import Kernel, except: [def: 1, def: 2], warn: false
