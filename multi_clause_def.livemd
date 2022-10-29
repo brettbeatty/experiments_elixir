@@ -1,0 +1,331 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Alternate Syntax for Multi-Clause Functions in Elixir
+
+## Why?
+
+Defining additional clauses for a function looks the same as defining entirely new functions;
+the names and arities just match the original.
+
+```elixir
+defmodule MyModule do
+  def first([head | _tail]) do
+    head
+  end
+
+  def first([]) do
+    nil
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 5, ...>>, {:first, 1}}
+```
+
+When a function has default arguments and multiple explicit clauses, the defaults must live
+in a separate function head.
+
+```elixir
+defmodule MyModule do
+  def first(list, default \\ nil)
+
+  def first([head | _tail], _default) do
+    head
+  end
+
+  def first([], default) do
+    default
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:first, 2}}
+```
+
+In my opinion this syntax has a couple downsides:
+
+* It can be to see at first glance that definitions are part of the same function and not
+  independent functions.
+* Defining many clauses of a function requires a lot of repetition.
+
+Multi-clause functions have a much more succinct syntax:
+
+```elixir
+first = fn
+  [head | _tail], _default ->
+    head
+
+  [], default ->
+    default
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Function<43.65746770/2 in :erl_eval.expr/5>
+```
+
+The anonymous function syntax is a lot clearer at first glance, and it is quite a bit more
+consistent with other Elixir constructs such as `case` (again most of this is my opinion).
+Unfortunately there's not a great way to use this syntax with named functions, and since
+anonymous functions must be a constant arity, their syntax doesn't provide for default
+arguments.
+
+This experiment is an attempt to combine my favorite parts of both syntaxes.
+
+## MultiClauseDef
+
+To support the syntax I created a new set of "def" macros. They look for use of the new
+syntax and transform it to multiple clauses of the function, falling back to their `Kernel`
+counterparts if the new syntax is not used.
+
+```elixir
+defmodule MultiClauseDef do
+  @typep clause() :: {[Macro.t()], guard(), keyword(), Macro.t()}
+  @typep def_type() :: :def | :defp | :defmacro | :defmacrop
+  @typep guard() :: (Macro.t() -> Macro.t())
+
+  defmacro def(call, expr) do
+    define(:def, call, expr, __CALLER__)
+  end
+
+  defmacro defp(call, expr) do
+    define(:defp, call, expr, __CALLER__)
+  end
+
+  defmacro defmacro(call, expr) do
+    define(:defmacro, call, expr, __CALLER__)
+  end
+
+  defmacro defmacrop(call, expr) do
+    define(:defmacrop, call, expr, __CALLER__)
+  end
+
+  @spec define(def_type(), Macro.t(), Macro.t(), Macro.Env.t()) :: Macro.t() | no_return()
+  defp define(type, call, expr, env) do
+    with {:ok, name, arity} <- parse_call(call),
+         {:ok, clauses, rest} <- parse_expr(expr, arity) do
+      quote do
+        # define a function head with the original call to handle default arguments
+        unquote(build_definition(type, call, nil))
+        # define each clause
+        unquote_splicing(build_definitions(type, name, clauses, rest))
+      end
+    else
+      # if the new syntax is not used, fallback to original syntax
+      :fallback ->
+        build_definition(type, call, expr)
+
+      {:arity, actual: actual, expected: expected, line: line} ->
+        raise CompileError,
+          description: "incorrect arity; expected: #{expected}, got: #{actual}",
+          file: env.file,
+          line: line || env.line
+    end
+  end
+
+  @spec parse_call(Macro.t()) :: {:ok, atom(), arity()} | :fallback
+  defp parse_call(call)
+
+  defp parse_call({name, _meta, args}) when is_atom(name) and is_list(args) do
+    {:ok, name, length(args)}
+  end
+
+  defp parse_call(_call) do
+    :fallback
+  end
+
+  @spec parse_expr(Macro.t(), arity()) ::
+          {:ok, [clause()], keyword()} | :fallback | {:arity, keyword()}
+  defp parse_expr(expr, arity)
+
+  defp parse_expr([{:do, clauses = [{:->, _, _} | _]} | rest], arity) do
+    parsed_clauses = Enum.map(clauses, &parse_clause/1)
+
+    case Enum.find(parsed_clauses, &bad_arity?(&1, arity)) do
+      {args, _guard, meta, _block} ->
+        {:arity, actual: length(args), expected: arity, line: meta[:line]}
+
+      nil ->
+        {:ok, parsed_clauses, rest}
+    end
+  end
+
+  defp parse_expr(_expr, _arity) do
+    :fallback
+  end
+
+  @spec parse_clause(Macro.t()) :: clause()
+  defp parse_clause({:->, meta, [args, block]}) do
+    {args, guard} = parse_guard(args)
+    {args, guard, meta, block}
+  end
+
+  @spec parse_guard(Macro.t()) :: {[Macro.t()], guard()}
+  defp parse_guard(args)
+
+  defp parse_guard([{:when, meta, args}]) do
+    {args, [guard]} = Enum.split(args, -1)
+    {args, &{:when, meta, [&1, guard]}}
+  end
+
+  defp parse_guard(args) do
+    {args, &Function.identity/1}
+  end
+
+  @spec bad_arity?(clause(), arity()) :: boolean()
+  defp bad_arity?({args, _guard, _meta, _block}, arity) do
+    length(args) != arity
+  end
+
+  @spec build_definitions(def_type(), atom(), [clause()], keyword()) :: [Macro.t()]
+  defp build_definitions(type, name, clauses, rest) do
+    Enum.map(clauses, fn {args, guard, meta, block} ->
+      call = guard.({name, meta, args})
+      build_definition(type, call, [{:do, block} | rest])
+    end)
+  end
+
+  @spec build_definition(def_type(), Macro.t(), Macro.t()) :: Macro.t()
+  defp build_definition(type, call, expr) do
+    quote do
+      Kernel.unquote(type)(unquote(call), unquote(expr))
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MultiClauseDef, <<70, 79, 82, 49, 0, 0, 26, ...>>, {:build_definition, 3}}
+```
+
+## Usage
+
+To use the new syntax, `def/2` (or whichever macro used) must be explicitly excluded from the
+automatic imports from `Kernel`. Then `def/2` must be imported from `MultiClauseDef`. It
+would be easy to wrap that in `__using__/1` so one could just `use MultiClauseDef`, but the
+docs recommend not providing a `__using__/1` that just imports, so I didn't do that.
+
+Using the new syntax to redefine `MyModule`, it feels clearer to me that I'm looking at 2
+clauses of the `first/2` function.
+
+```elixir
+defmodule MyModule do
+  import Kernel, except: [def: 2], warn: false
+  import MultiClauseDef, only: [def: 2]
+
+  def first(list, default \\ nil) do
+    [head | _tail], _default ->
+      head
+
+    [], default ->
+      default
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:first, 2}}
+```
+
+The defined function works as expected. When passed a non-empty list, the first clause
+matches and returns the first element in the list.
+
+```elixir
+MyModule.first([:a, :b, :c], :d)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:a
+```
+
+If the list is empty, the second clause matches and returns the default.
+
+```elixir
+MyModule.first([], :d)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:d
+```
+
+And the default argument for default still works.
+
+```elixir
+MyModule.first([])
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+nil
+```
+
+Guard clauses also work as expected, clause order is preserved, and the new macros can be
+used with single-clause functions. To illustrate, I'll create a function that dispatches to
+a recursive private function (the exact functionality is gibberish and doesn't matter).
+
+```elixir
+defmodule AnotherModule do
+  import Kernel, except: [def: 2, defp: 2]
+  import MultiClauseDef, only: [def: 2, defp: 2]
+
+  def do_something(string) when is_binary(string) do
+    do_something(string, [])
+  end
+
+  defp do_something(string, acc) do
+    <<character, string::binary>>, acc when character in ?a..?z ->
+      do_something(string, [character + ?A - ?a | acc])
+
+    <<character, string::binary>>, acc when character in ?0..?9 ->
+      do_something(string, [character | acc])
+
+    <<_character, string::binary>>, acc ->
+      do_something(string, acc)
+
+    <<>>, acc ->
+      :erlang.list_to_binary(acc)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, AnotherModule, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:do_something, 2}}
+```
+
+And just to show that compiled into something that does something:
+
+```elixir
+AnotherModule.do_something("Ch4WYqWoXzZ+pWwuvyB/Nsio5LvgUT5kH0Qh9BV5V8Q=")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"859H0K5GV5OISYVUWPZOQ4H"
+```
+
+## Wrap Up
+
+Of course I'd never do something like this in production code, but this exercise was fun for
+me. I got to play with metaprogramming, and I'm pretty happy with how the new syntax turned
+out. I feel like especially with the second example the separation between the public
+`do_something/1` and the private `do_something/2` is much clearer than the standard syntax.
