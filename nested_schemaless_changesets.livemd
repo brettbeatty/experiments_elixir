@@ -1,0 +1,261 @@
+# Nested Schemaless Changesets
+
+```elixir
+Mix.install(ecto: "~> 3.9")
+```
+
+## Intro
+
+Ecto changesets are great for validating data, and schemaless changesets allow us to do so without defining modules specifically for the data we're validating. Unfortunately schemaless changesets don't support nested types. This experiment was an attempt to make nested schemaless changesets work.
+
+## Data
+
+I needed some nested data to showcase what I was trying to do. Eventually I settled on a recipe, as I could come up with a deep nesting: a recipe has many ingredients, which each has a nested measure.
+
+Note: I made up these quantities. They may not make for a good sandwich.
+
+```elixir
+valid_data = %{
+  "name" => "PB&J",
+  "ingredients" => [
+    %{
+      "name" => "bread",
+      "measure" => %{
+        "quantity" => 2.0,
+        "unit" => "slices"
+      }
+    },
+    %{
+      "name" => "peanut butter",
+      "measure" => %{
+        "quantity" => 1.5,
+        "unit" => "Tbsp"
+      }
+    },
+    %{
+      "name" => "jam",
+      "measure" => %{
+        "quantity" => 1.0,
+        "unit" => "Tbsp"
+      }
+    }
+  ],
+  "steps" => [
+    "Spread peanut butter on face of one slice of bread",
+    "Spread jam on face of the other slice of bread",
+    "Join the bread slices, peanut butter face to jelly face"
+  ]
+}
+```
+
+Since changesets are all about validation, having some invalid data at various nesting levels will be useful for demonstrating things. The invalid data will drop that the first ingredient is bread, and it will spell out the jam quantity instead of using a float.
+
+```elixir
+invalid_data =
+  valid_data
+  |> update_in(["ingredients", Access.at(0)], &Map.delete(&1, "name"))
+  |> put_in(["ingredients", Access.at(2), "measure", "quantity"], "one")
+```
+
+## Schemas & Embeds
+
+To show the behavior I was looking to emulate, I created some schemas representing our data models, using embeds to nest the other schemas.
+
+```elixir
+defmodule Measure do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @primary_key false
+  embedded_schema do
+    field(:quantity, :float)
+    field(:unit, :string)
+  end
+
+  def changeset(measure, attrs) do
+    measure
+    |> cast(attrs, [:quantity, :unit])
+    |> validate_required([:quantity, :unit])
+  end
+end
+
+defmodule Ingredient do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @primary_key false
+  embedded_schema do
+    field(:name, :string)
+    embeds_one(:measure, Measure)
+  end
+
+  def changeset(ingredient, attrs) do
+    ingredient
+    |> cast(attrs, [:name])
+    |> cast_embed(:measure, required: true)
+    |> validate_required([:name])
+  end
+end
+
+defmodule Recipe do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @primary_key false
+  embedded_schema do
+    field(:name, :string)
+    embeds_many(:ingredients, Ingredient)
+    field(:steps, {:array, :string})
+  end
+
+  def changeset(recipe, attrs) do
+    recipe
+    |> cast(attrs, [:name, :steps])
+    |> cast_embed(:ingredients, required: true)
+    |> validate_required([:name, :steps])
+  end
+end
+```
+
+```elixir
+%Recipe{}
+|> Recipe.changeset(valid_data)
+|> Ecto.Changeset.apply_action(:insert)
+```
+
+```elixir
+%Recipe{}
+|> Recipe.changeset(invalid_data)
+|> Ecto.Changeset.apply_action(:insert)
+```
+
+```elixir
+consolidate_errors = fn result ->
+  with {:error, changeset} <- result do
+    {:error, Ecto.Changeset.traverse_errors(changeset, &Function.identity/1)}
+  end
+end
+
+%Recipe{}
+|> Recipe.changeset(invalid_data)
+|> Ecto.Changeset.apply_action(:insert)
+|> consolidate_errors.()
+```
+
+```elixir
+defmodule Nestled do
+  defstruct [:cardinality, :types]
+
+  def cast(changeset, name, changeset_fun) do
+    {:embed, %__MODULE__{cardinality: cardinality, types: types}} = changeset.types[name]
+    data = changeset.data[name]
+    param_key = Atom.to_string(name)
+
+    with %{params: %{^param_key => params}} <- changeset do
+      {change, valid?} =
+        case cardinality do
+          :one ->
+            cast_one(params, changeset_fun, data || %{}, types)
+
+          :many ->
+            cast_many(params, changeset_fun, data || [], types, [], true)
+        end
+
+      changeset
+      |> Map.update!(:changes, &Map.put(&1, name, change))
+      |> Map.update!(:valid?, &(&1 and valid?))
+    end
+  end
+
+  defp cast_one(params, changeset_fun, data, types) do
+    changeset = changeset_fun.({data, types}, params)
+    {changeset, changeset.valid?}
+  end
+
+  defp cast_many([params | params_remaining], changeset_fun, data, types, acc, valid?) do
+    {data, data_remaining} =
+      case data do
+        [data | data_remaining] -> {data, data_remaining}
+        [] -> {%{}, []}
+      end
+
+    changeset = changeset_fun.({data, types}, params)
+
+    cast_many(
+      params_remaining,
+      changeset_fun,
+      data_remaining,
+      types,
+      [changeset | acc],
+      valid? and changeset.valid?
+    )
+  end
+
+  defp cast_many([], _changeset_fun, _data, _types, acc, valid?) do
+    {:lists.reverse(acc), valid?}
+  end
+
+  def many(types) do
+    {:embed, %__MODULE__{cardinality: :many, types: Map.new(types)}}
+  end
+
+  def one(types) do
+    {:embed, %__MODULE__{cardinality: :one, types: Map.new(types)}}
+  end
+end
+```
+
+```elixir
+recipe_types = %{
+  name: :string,
+  ingredients:
+    Nestled.many(
+      name: :string,
+      measure:
+        Nestled.one(
+          quantity: :float,
+          unit: :string
+        )
+    ),
+  steps: {:array, :string}
+}
+
+measure_changeset = fn measure, attrs ->
+  import Ecto.Changeset
+
+  measure
+  |> cast(attrs, [:quantity, :unit])
+  |> validate_required([:quantity, :unit])
+end
+
+ingredient_changeset = fn ingredient, attrs ->
+  import Ecto.Changeset
+
+  ingredient
+  |> cast(attrs, [:name])
+  |> Nestled.cast(:measure, measure_changeset)
+  |> validate_required([:name])
+end
+
+recipe_changeset = fn recipe, attrs ->
+  import Ecto.Changeset
+
+  recipe
+  |> cast(attrs, [:name, :steps])
+  |> Nestled.cast(:ingredients, ingredient_changeset)
+  |> validate_required([:name, :steps])
+end
+```
+
+```elixir
+{%{}, recipe_types}
+|> recipe_changeset.(valid_data)
+|> Ecto.Changeset.apply_action(:insert)
+```
+
+```elixir
+{%{}, recipe_types}
+|> recipe_changeset.(invalid_data)
+|> Ecto.Changeset.apply_action(:insert)
+|> consolidate_errors.()
+```
