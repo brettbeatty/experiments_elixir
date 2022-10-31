@@ -1,0 +1,270 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Module Patching
+
+## Intro
+
+Sometimes in Livebook I want to define a module iteratively, only focusing on one piece at a time. That can be difficult in Elixir because once a module is compiled, that's it. You can compile a new version of that module, but you can't open a compiled module and add more functions to it. This experiment is an attempt to make iterating on modules more friendly.
+
+## Code
+
+The code ended up being fairly simple. It defines a new macro, `defmodule/3`, which looks like `defmodule/2` except it also takes a version. It then stores the contents of that module version in ETS. Then it defines the module, using all the code from the versions less than or equal to the one passed in, allowing one to iterate on a version and recompile past versions without including killed code.
+
+```elixir
+defmodule ModulePatching do
+  defmacro defmodule(alias, version, do_block) do
+    [do: block] = do_block
+    module = Macro.expand(alias, __CALLER__)
+    version = Macro.expand(version, __CALLER__)
+    store_block(module, version, block)
+
+    quote do
+      defmodule unquote(alias) do
+        (unquote_splicing(patches_so_far(module, version)))
+      end
+    end
+  end
+
+  defp store_block(module, version, block) do
+    :ets.insert(__MODULE__, {{module, version}, block})
+  end
+
+  defp patches_so_far(module, version) do
+    __MODULE__
+    |> :ets.select([{{{module, :"$1"}, :"$2"}, [{:"=<", :"$1", version}], [:"$2"]}])
+    |> Enum.flat_map(&unblock/1)
+  end
+
+  defp unblock(ast)
+  defp unblock({:__block__, _meta, block}), do: block
+  defp unblock(ast), do: [ast]
+
+  def start do
+    with :undefined <- :ets.whereis(__MODULE__) do
+      __MODULE__ = :ets.new(__MODULE__, [:ordered_set, :named_table])
+    end
+
+    :ok
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, ModulePatching, <<70, 79, 82, 49, 0, 0, 12, ...>>, {:start, 0}}
+```
+
+To start using it one just needs to import `defmodule/3` and create the ETS table.
+
+```elixir
+import ModulePatching, only: [defmodule: 3]
+ModulePatching.start()
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Example
+
+The first version of `MyModule` will have 2 functions: `a/1` and `b/1`.
+
+```elixir
+defmodule MyModule, 1 do
+  def a(x), do: x + 1
+  def b(x), do: x * 2
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:b, 1}}
+```
+
+`a/1` increments a value.
+
+```elixir
+MyModule.a(3)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+4
+```
+
+`b/1` doubles a value.
+
+```elixir
+MyModule.b(4)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+8
+```
+
+And `c/1` does not exist yet.
+
+```elixir
+MyModule.c(5)
+```
+
+Time to define it! Notice the version for `MyModule` is now `2`.
+
+```elixir
+defmodule MyModule, 2 do
+  def c(x), do: x * x
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:c, 1}}
+```
+
+`a/1` still exists and behaves as expected.
+
+```elixir
+MyModule.a(3)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+4
+```
+
+As does `b/1`.
+
+```elixir
+MyModule.b(4)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+8
+```
+
+But now there is a `c/1`, which squares a value.
+
+```elixir
+MyModule.c(5)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+25
+```
+
+But what if one tries to redefine `a/1`? Attempting it results in some warnings.
+
+```elixir
+defmodule MyModule, 3 do
+  def a(x), do: rem(x, 3)
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: clauses with the same name and arity (number of arguments) should be grouped together, "def a/1" was previously defined (module_patching.livemd#cell:j6kw57gxy7j2zmq4nyp4t7gx772qzv5m:2)
+  module_patching.livemd#cell:j6kw57gxy7j2zmq4nyp4t7gx772qzv5m:2
+
+warning: this clause for a/1 cannot match because a previous clause at line 2 always matches
+  module_patching.livemd#cell:j6kw57gxy7j2zmq4nyp4t7gx772qzv5m:2
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:a, 1}}
+```
+
+The new definition for `a/1` just gets added as an additional clause for the existing `a/1`, and the new clause will never match because the old one always will.
+
+```elixir
+# 3 + 1, not rem(3, 3)
+MyModule.a(3)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+4
+```
+
+Instead one could use `defoverridable/1` to override the existing function.
+
+```elixir
+defmodule MyModule, 3 do
+  defoverridable a: 1
+  def a(x), do: rem(x, 3)
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:a, 1}}
+```
+
+Now the new clause for `a/1` is the only one.
+
+```elixir
+# rem(3, 3)
+MyModule.a(3)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+0
+```
+
+`defoverridable/1` also provides `super`, which in this case can be useful for iterating on the existing function: transforming an input or output, adding a side effect, or whatever.
+
+```elixir
+defmodule MyModule, 4 do
+  defoverridable c: 1
+  def c(x), do: x |> super() |> div(2)
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyModule, <<70, 79, 82, 49, 0, 0, 7, ...>>, {:c, 1}}
+```
+
+Now this version of `c/4` takes a value, squares it, and halves the result (using integer division).
+
+```elixir
+# div(5 * 5, 2)
+MyModule.c(5)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+12
+```
+
+## Reflection
+
+I'd hoped to find some way to generate version numbers automatically, maybe using something in `__ENV__` or the module vsn (for hot reloading) to point towards an order. But I didn't see anything that looked like it would work for that.
+
+I'd also thought it would be nice to tie calls to the version in cells previous to the calls, but I ran into similar problems there. Also I suppose being able to run some code in one cell and use it in an earlier cell is in line with how variables and code compilation already work in livebook.
+
+I did have fun learning more about `:ets.select/2` and ETS matchspecs.
+
+And I feel like the experiment was successful: I set out to allow for module patching, and it works. It would be fairly simple to librarify this and use it in other livebooks.
