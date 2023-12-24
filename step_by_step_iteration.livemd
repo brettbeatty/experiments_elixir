@@ -1,0 +1,197 @@
+# Step-by-Step Iteration
+
+## Section
+
+```elixir
+defmodule Next do
+  @moduledoc """
+  Next aims to make it easier to step through enumerables a few elements at a time.
+  """
+  @typep cmd_acc(element) ::
+           {:cont, {non_neg_integer(), [element]}}
+           | {:halt, [element]}
+           | {:suspend, [element]}
+  @opaque iterator(element) :: (cmd_acc(element) -> result(element))
+  @type iterator() :: iterator(any())
+  @type next_fun(element) :: (non_neg_integer() -> [element])
+  @typep result(element) ::
+           {:done, [element]}
+           | {:halted, []}
+           | {:suspended, [element], iterator(element)}
+
+  @doc """
+  Halt `iterator`.
+
+  All iterators should be halted if not fully-traversed. See `take/2` for more details.
+
+  ## Examples
+
+      iex> iter = Next.iterate(1..5)
+      iex> {:cont, [1, 2], iter} = Next.take(iter, 2)
+      iex> Next.halt(iter)
+      :ok
+
+  """
+  @spec halt(iterator()) :: :ok
+  def halt(iterator) do
+    {:halted, []} = iterator.({:halt, []})
+    :ok
+  end
+
+  @doc """
+  Create an iterator from an enumerable.
+
+  Enumerable is not traversed until the first call to `take/2`.
+
+  ## Examples
+
+      iex> Next.iterate([:a, :b, :c])
+
+  """
+  @spec iterate(Enumerable.t(element)) :: iterator(element) when element: var
+  def iterate(enumerable) do
+    fn cmd_acc ->
+      Enumerable.reduce(enumerable, cmd_acc, &do_iterate/2)
+    end
+  end
+
+  @spec do_iterate(element, {non_neg_integer(), [element]}) :: cmd_acc(element)
+        when element: var
+  defp do_iterate(element, {count, elements}) do
+    build_cmd_acc(count, [element | elements])
+  end
+
+  @spec build_cmd_acc(non_neg_integer(), [element]) :: cmd_acc(element) when element: var
+  defp build_cmd_acc(count, elements)
+
+  defp build_cmd_acc(count, elements) when count > 0 do
+    {:cont, {count - 1, elements}}
+  end
+
+  defp build_cmd_acc(0, elements) do
+    {:suspend, elements}
+  end
+
+  @doc """
+  Create a managed iterator to automatically halt as needed.
+
+  Iterator is stored in the process dictionary and removed at the end of the call to `fun`.
+  Therefore, `next` function should not be called in other processes or after `fun` ends.
+
+  ## Example
+
+      Next.iterate(0..11, fn next ->
+        [] = next.(0)
+        [0] = next.(1)
+        [1, 2] = next.(2)
+        [3, 4, 5] = next.(3)
+        [6, 7, 8, 9] = next.(4)
+        [10, 11] = next.(5)
+        [] = next.(6)
+      end)
+
+  """
+  @spec iterate(Enumerable.t(element), (next_fun(element) -> result)) :: result
+        when element: var, result: var
+  def iterate(enumerable, fun) do
+    key = make_ref()
+
+    try do
+      Process.put(key, iterate(enumerable))
+      fun.(&dictionary_take(key, &1))
+    after
+      key
+      |> Process.delete()
+      |> halt()
+    end
+  end
+
+  @spec dictionary_take(reference(), non_neg_integer()) :: list()
+  defp dictionary_take(key, count) do
+    case key |> fetch_iterator!() |> take(count) do
+      {:cont, elements, iterator} ->
+        Process.put(key, iterator)
+        elements
+
+      {:done, elements} ->
+        Process.put(key, &empty_iterator/1)
+        elements
+    end
+  end
+
+  @spec fetch_iterator!(reference()) :: iterator()
+  defp fetch_iterator!(key) do
+    case Process.get(key) do
+      iterator when is_function(iterator, 1) ->
+        iterator
+
+      nil ->
+        raise "cannot take items from Next.iterate/2 outside of `fun` or in another process"
+    end
+  end
+
+  @spec empty_iterator(cmd_acc(element)) :: result(element) when element: var
+  defp empty_iterator(cmd_acc)
+
+  defp empty_iterator({:cont, {_count, elements}}) do
+    {:done, elements}
+  end
+
+  defp empty_iterator({:suspend, elements}) do
+    {:suspended, elements, &empty_iterator/1}
+  end
+
+  defp empty_iterator({:halt, elements}) do
+    {:halted, elements}
+  end
+
+  @doc """
+  Take `count` elements from `iterator`.
+
+  To allow enumerables to clean themselves up properly as described in the `Enumerable`
+  protocol, there are a couple rules to follow with iterators:
+    - Each iterator value should be passed to `take/2` only once. Any subsequent operations
+      should be performed on the new, returned iterator value.
+    - Once an iterator has been passed to `take/2`, iteration must be either completed or
+      halted:
+      - If `take/2` returns `{:done, elements}`, iteration has completed.
+      - If `take/2` returns `{:cont, elements, new_iterator}` but `new_iterator` is not
+        sent to `take/2`, it must be sent to `halt/1`.
+
+  These rules are not as critical for simple, stateless enumerables that require no cleanup,
+  but they should be followed espeically when the source of the enumerable is unknown.
+
+  `iterate/2` intends to make it easier to follow these rules by managing the iterator
+  itself.
+
+  ## Examples
+
+      iex> iter = Next.iterate(0..5)
+      iex> {:cont, [0, 1, 2], iter} = Next.take(iter, 3)
+      iex> {:cont, [3, 4, 5], iter} = Next.take(iter, 3)
+      iex> {:done, []} = Next.take(iter, 3)
+
+      iex> iter = Next.iterate([:a, :b, :c])
+      iex> {:cont, [:a, :b], iter} = Next.take(iter, 2)
+      iex> {:done, [:c]} = Next.take(iter, 2)
+
+      iex> iter = [:ok] |> Stream.cycle() |> Next.iterate()
+      iex> {:cont, [:ok, :ok, :ok], iter} = Next.take(iter, 3)
+      iex> Next.halt(iter)
+      :ok
+
+  """
+  @spec take(iterator(element), non_neg_integer()) ::
+          {:cont, [element], iterator(element)} | {:done, [element]}
+        when element: var
+  def take(iterator, count) when is_integer(count) and count > 0 do
+    case count |> build_cmd_acc([]) |> iterator.() do
+      {:done, {_count, elements}} ->
+        {:done, :lists.reverse(elements)}
+
+      {:suspended, elements, new_iterator} ->
+        {:cont, :lists.reverse(elements), new_iterator}
+    end
+  end
+end
+```
