@@ -1,0 +1,308 @@
+# Absinthe Ecto Assoc
+
+```elixir
+Mix.install([
+  :absinthe,
+  :absinthe_plug,
+  :ecto,
+  :ecto_sql,
+  :jason,
+  :plug,
+  :plug_cowboy,
+  :postgrex
+])
+```
+
+## Introduction
+
+It seems to me like a lot of complexity is added to our apps with GraphQL's field selection feature. When resolving a field, we don't want to do more work than is required by the selection of subfields, but when those subfields are requested it's often easier and more efficient to handle them at the parent level. Mechanisms such as batching and dataloader seek to cut down on that work in Absinthe, and one could look at the requested subfields when resolving the parent object, but each introduces its own complexity.
+
+One class of resolution that could be tooled to provide a much simpler interface is lazy loading of Ecto schema associations. This document aims to experiment on that approach.
+
+## Repo
+
+Create a simple Ecto repo pointing at the database "absinthe_ecto_assoc".
+
+```elixir
+defmodule Repo do
+  use Ecto.Repo, adapter: Ecto.Adapters.Postgres, otp_app: nil
+
+  @impl Ecto.Repo
+  def init(_context, config) do
+    {:ok, Keyword.put(config, :url, "postgres://localhost:5432/absinthe_ecto_assoc")}
+  end
+end
+```
+
+Analogous to `mix ecto.create`.
+
+```elixir
+Ecto.Adapters.Postgres.storage_up(Repo.config())
+```
+
+Start repo.
+
+```elixir
+{:ok, _pid} = Repo.start_link()
+```
+
+## User
+
+We need some associated schemas. Users will have basically just a name.
+
+```elixir
+Repo.query!("DROP TABLE IF EXISTS users CASCADE")
+
+Repo.query!("""
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  inserted_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+)
+""")
+
+:ok
+```
+
+```elixir
+defmodule User do
+  use Ecto.Schema
+
+  schema "users" do
+    field(:name, :string)
+    has_many(:orders, Order)
+    timestamps(type: :utc_datetime)
+  end
+end
+```
+
+## Order
+
+The other schema, orders, will have an order number and a user to whom they belong.
+
+```elixir
+Repo.query!("DROP TABLE IF EXISTS orders")
+
+Repo.query!("""
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER REFERENCES users(id) NOT NULL,
+  number UUID NOT NULL,
+  inserted_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+)
+""")
+
+:ok
+```
+
+```elixir
+defmodule Order do
+  use Ecto.Schema
+
+  schema "orders" do
+    belongs_to(:user, User)
+    field(:number, Ecto.UUID, autogenerate: true)
+    timestamps(type: :utc_datetime)
+  end
+end
+```
+
+## Seeds
+
+Seed some users. User A will have 3 orders, User B will have 1 order, and User C will have 0 orders.
+
+```elixir
+user_a = Repo.insert!(%User{name: "User A", orders: [%Order{}, %Order{}, %Order{}]})
+user_b = Repo.insert!(%User{name: "User B", orders: [%Order{}]})
+user_c = Repo.insert!(%User{name: "User C"})
+:ok
+```
+
+## Preload middleware
+
+This is the main point of the experiment. Preload is both a middleware and a plugin. For each stage of resolution in Absinthe:
+
+1. The Preload plugin performs some setup and lets Absinthe attempt resolution (`before_resolution/1`).
+2. The Preload middleware signals a need to preload for any fields using it and defers resolution of that field (`call/2` when state is `:unresolved`).
+3. Once that stage of resolution has completed, the Preload plugin looks for any of those signals, groups them by parent model and requested preloads, and uses `Repo` to preload the requested associations (`after_resolution/1`).
+4. If any of those signals were received, the Preload plugin schedules another round of resolution (`pipeline/2`).
+5. In this round the Preload middleware replaces deferred fields' old parent objects with those having preloaded associations (`call/2` when state is `:suspended`).
+6. When the field's state is restored from `:suspended` to `:unresolved`, Absinthe applies the other middlewares pertaining to that field to resolve them.
+
+```elixir
+defmodule Preload do
+  @behaviour Absinthe.Middleware
+  @behaviour Absinthe.Plugin
+
+  @impl Absinthe.Middleware
+  def call(res, assocs)
+
+  def call(res, assocs) when res.state == :unresolved do
+    key = [Access.key!(:acc), __MODULE__, :input, Access.key(res.source, [])]
+    update = fn acc -> List.wrap(assocs) ++ acc end
+
+    res
+    |> update_in(key, update)
+    |> Map.update!(:middleware, &[{__MODULE__, assocs} | &1])
+    |> Map.put(:state, :suspended)
+  end
+
+  def call(res, _assocs) when res.state == :suspended do
+    preloaded =
+      res.acc
+      |> Map.fetch!(__MODULE__)
+      |> Map.fetch!(:output)
+
+    res
+    |> Map.update!(:source, &Map.fetch!(preloaded, &1))
+    |> Map.put(:state, :unresolved)
+  end
+
+  @impl Absinthe.Plugin
+  def before_resolution(exec) do
+    update_in(exec, [Access.key!(:acc), __MODULE__], fn
+      nil ->
+        %{input: %{}, output: %{}}
+
+      acc when is_map(acc) ->
+        Map.put(acc, :input, %{})
+    end)
+  end
+
+  @impl Absinthe.Plugin
+  def after_resolution(exec) do
+    update_in(exec, [Access.key!(:acc), __MODULE__], &preload_all/1)
+  end
+
+  defp preload_all(acc) do
+    output =
+      acc.input
+      |> Enum.group_by(&group_key/1, &group_value/1)
+      |> Enum.flat_map(&preload_group/1)
+      |> Map.new()
+
+    %{acc | output: output}
+  end
+
+  defp group_key(preload) do
+    {%schema{}, assocs} = preload
+    {schema, assocs}
+  end
+
+  defp group_value(preload) do
+    {object, _assocs} = preload
+    object
+  end
+
+  defp preload_group(group) do
+    {{_schema, assocs}, objects} = group
+    preloaded = Repo.preload(objects, assocs)
+    # assumption that order preserved
+    Enum.zip(objects, preloaded)
+  end
+
+  @impl Absinthe.Plugin
+  def pipeline(pipeline, exec) do
+    if map_size(exec.acc[__MODULE__].input) > 0 do
+      [Absinthe.Phase.Document.Execution.Resolution | pipeline]
+    else
+      pipeline
+    end
+  end
+end
+```
+
+## GraphQL schema
+
+This basic schema illustrates use of Preload. Preload is added to the schema's plugins in `plugins/0`. The Preload middleware is also added to the "orders" and "order_quantity" fields. If neither field is requested, orders will not be preloaded for the parent users. If either field is requested, orders will be preloaded. If both fields are requested, orders will still only need preloaded once.
+
+A more complex schema could better test/illustrate more facets of that relationship (preloading more than one association, preloading associations for more object variety, preloading different associations for different fields, etc.), but I kept this simple for illustrative purposes.
+
+```elixir
+defmodule Schema do
+  use Absinthe.Schema
+
+  @impl Absinthe.Schema
+  def plugins do
+    [Preload] ++ Absinthe.Plugin.defaults()
+  end
+
+  query do
+    field :all_users, non_null(list_of(non_null(:user))) do
+      resolve(fn _args, _info ->
+        {:ok, User |> Repo.all() |> Enum.shuffle()}
+      end)
+    end
+  end
+
+  object :user do
+    field(:id, non_null(:id))
+    field(:name, non_null(:string))
+
+    field :orders, non_null(list_of(non_null(:order))) do
+      middleware(Preload, :orders)
+
+      # setting middleware wipes out default middleware,
+      # so this adds it back
+      middleware(Absinthe.Middleware.MapGet, :orders)
+    end
+
+    field :order_quantity, non_null(:integer) do
+      middleware(Preload, :orders)
+
+      resolve(fn user, _args, _info ->
+        {:ok, length(user.orders)}
+      end)
+    end
+  end
+
+  object :order do
+    # just to see the IDs match, didn't want a nested association
+    field(:user_id, :id)
+    field(:number, :id)
+  end
+end
+```
+
+## Endpoint
+
+This section just creates a simple server for hosting a GraphiQL interface for the schema at [http://localhost:27388/](http://localhost:27388/).
+
+A simple query for seeing this experiment in action is this:
+
+```graphql
+query MyQuery {
+  allUsers {
+    id
+    name
+    orders {
+      userId
+      number
+    }
+    orderQuantity
+  }
+}
+```
+
+```elixir
+defmodule Endpoint do
+  use Plug.Builder
+
+  plug(Plug.Parsers,
+    parsers: [:json, Absinthe.Plug.Parser],
+    pass: ["*/*"],
+    json_decoder: Jason
+  )
+
+  plug(Absinthe.Plug.GraphiQL, schema: Schema)
+end
+```
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+Plug.Cowboy.shutdown(Endpoint.Http)
+Plug.Cowboy.http(Endpoint, [], port: 27388)
+```
